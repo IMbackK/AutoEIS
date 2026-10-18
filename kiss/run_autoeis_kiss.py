@@ -37,6 +37,7 @@ import json
 import re
 import sys
 import time
+import traceback
 from pathlib import Path
 
 import numpy as np
@@ -294,29 +295,20 @@ def main(argv: list[str] | None = None) -> int:
     summary_rows = []
     for i, (name, s) in enumerate(entries, 1):
         base = Path(name).stem
-        freq, Z = s.to_autoeis()
-        print(f"[{i}/{len(entries)}] {base} (class {s.class_string}, {len(freq)} pts)")
-
         t0 = time.time()
-        res = run_pipeline(
-            freq, Z,
-            iters=args.iters, tol=args.tol, terminals=args.terminals,
-            complexity=args.complexity,
-            num_warmup=args.warmup, num_samples=args.samples,
-            num_chains=args.chains, seed=args.seed, method=args.method,
-            parallel=parallel,
-        )
-        runtime = time.time() - t0
 
+        # Base row: every column present up front. Count fields stay numeric
+        # (0 on failure) so downstream comparisons like `n_converged > 0` hold.
+        # Any exception in the pipeline fills `error` and the run continues.
         row = {
             "name": base,
             "class": s.class_string,
-            "n_points": len(freq),
-            "fmin_Hz": f"{freq.min():.6g}",
-            "fmax_Hz": f"{freq.max():.6g}",
-            "n_candidates": res["n_candidates"],
-            "n_plausible": res["n_plausible"],
-            "n_converged": res["n_converged"],
+            "n_points": len(s.omega),
+            "fmin_Hz": "",
+            "fmax_Hz": "",
+            "n_candidates": 0,
+            "n_plausible": 0,
+            "n_converged": 0,
             "top1_circuit": "",
             "top1_waic": "",
             "top2_circuit": "",
@@ -327,40 +319,70 @@ def main(argv: list[str] | None = None) -> int:
             "gt_canonical": canonical_kiss(s.class_string),
             "top1": False,
             "top3": False,
-            "t_gep_s": f"{res['t_gep']:.1f}",
-            "t_mcmc_s": f"{res['t_mcmc']:.1f}",
-            "runtime_s": f"{runtime:.1f}",
+            "t_gep_s": "",
+            "t_mcmc_s": "",
+            "runtime_s": "",
+            "error": "",
         }
 
-        if res["ranked"] is not None:
-            best = res["best"]
-            top3_df = res["ranked"].head(3)
-            for k in range(len(top3_df)):
-                row[f"top{k + 1}_circuit"] = top3_df.iloc[k].circuitstring
-                row[f"top{k + 1}_waic"] = f"{top3_df.iloc[k]['WAIC (sum)']:.4g}"
-            row["top1_canonical"] = canonical_autoeis(row["top1_circuit"])
-            row["top1"] = row["top1_canonical"] == row["gt_canonical"]
-            top3_canon = [canonical_autoeis(c) for c in top3_df.circuitstring]
-            row["top3"] = row["gt_canonical"] in top3_canon
-
-            res["ranked"].drop(
-                columns=["InferenceResult", "Z_pred"]
-            ).to_csv(specdir / f"{base}.csv", index=False)
-            top3_json = {
-                f"top{k + 1}": circuit_json(
-                    top3_df.iloc[k]["InferenceResult"],
-                    top3_df.iloc[k]["WAIC (sum)"],
-                )
-                for k in range(len(top3_df))
-            }
-            with open(specdir / f"{base}_best.json", "w") as f:
-                json.dump(top3_json, f, indent=2)
-            print(
-                f"    best: {best.circuitstring}  WAIC {best['WAIC (sum)']:.1f}  "
-                f"top1={row['top1']} top3={row['top3']}  ({runtime:.0f}s)"
+        try:
+            freq, Z = s.to_autoeis()
+            print(f"[{i}/{len(entries)}] {base} (class {s.class_string}, {len(freq)} pts)")
+            res = run_pipeline(
+                freq, Z,
+                iters=args.iters, tol=args.tol, terminals=args.terminals,
+                complexity=args.complexity,
+                num_warmup=args.warmup, num_samples=args.samples,
+                num_chains=args.chains, seed=args.seed, method=args.method,
+                parallel=parallel,
             )
-        else:
-            print(f"    no ranked circuits  ({runtime:.0f}s)")
+            runtime = time.time() - t0
+
+            row["fmin_Hz"] = f"{freq.min():.6g}"
+            row["fmax_Hz"] = f"{freq.max():.6g}"
+            row["n_candidates"] = res["n_candidates"]
+            row["n_plausible"] = res["n_plausible"]
+            row["n_converged"] = res["n_converged"]
+            row["t_gep_s"] = f"{res['t_gep']:.1f}"
+            row["t_mcmc_s"] = f"{res['t_mcmc']:.1f}"
+            row["runtime_s"] = f"{runtime:.1f}"
+
+            if res["ranked"] is not None:
+                best = res["best"]
+                top3_df = res["ranked"].head(3)
+                for k in range(len(top3_df)):
+                    row[f"top{k + 1}_circuit"] = top3_df.iloc[k].circuitstring
+                    row[f"top{k + 1}_waic"] = f"{top3_df.iloc[k]['WAIC (sum)']:.4g}"
+                row["top1_canonical"] = canonical_autoeis(row["top1_circuit"])
+                row["top1"] = row["top1_canonical"] == row["gt_canonical"]
+                top3_canon = [canonical_autoeis(c) for c in top3_df.circuitstring]
+                row["top3"] = row["gt_canonical"] in top3_canon
+
+                res["ranked"].drop(
+                    columns=["InferenceResult", "Z_pred"]
+                ).to_csv(specdir / f"{base}.csv", index=False)
+                top3_json = {
+                    f"top{k + 1}": circuit_json(
+                        top3_df.iloc[k]["InferenceResult"],
+                        top3_df.iloc[k]["WAIC (sum)"],
+                    )
+                    for k in range(len(top3_df))
+                }
+                with open(specdir / f"{base}_best.json", "w") as f:
+                    json.dump(top3_json, f, indent=2)
+                print(
+                    f"    best: {best.circuitstring}  WAIC {best['WAIC (sum)']:.1f}  "
+                    f"top1={row['top1']} top3={row['top3']}  ({runtime:.0f}s)"
+                )
+            else:
+                print(f"    no ranked circuits  ({runtime:.0f}s)")
+        except Exception as e:
+            runtime = time.time() - t0
+            row["runtime_s"] = f"{runtime:.1f}"
+            row["error"] = f"{type(e).__name__}: {e}"
+            traceback.print_exc()
+            print(f"[{i}/{len(entries)}] {base} (class {s.class_string}) "
+                  f"FAILED: {type(e).__name__}: {e}  ({runtime:.0f}s) - continuing")
 
         summary_rows.append(row)
 
@@ -368,12 +390,18 @@ def main(argv: list[str] | None = None) -> int:
     summary.to_csv(outdir / "summary.csv", index=False)
 
     n = len(summary)
+    n_failed = int((summary["error"] != "").sum())
     n_ranked = int((summary["n_converged"] > 0).sum())
     n1 = int(summary["top1"].sum())
     n3 = int(summary["top3"].sum())
-    print(f"\n=== summary: {n} spectra, {n_ranked} with ranked circuits ===")
+    print(f"\n=== summary: {n} spectra, {n_ranked} with ranked circuits, "
+          f"{n_failed} failed ===")
     print(f"top-1 accuracy: {n1}/{n} = {n1 / n:.0%}")
     print(f"top-3 accuracy: {n3}/{n} = {n3 / n:.0%}")
+    if n_failed:
+        print(f"failed spectra (see 'error' column):")
+        for _, r in summary[summary["error"] != ""].iterrows():
+            print(f"  {r['name']}: {r['error']}")
     print(f"summary written to {outdir / 'summary.csv'}")
     return 0
 
