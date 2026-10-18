@@ -1304,6 +1304,8 @@ class InferenceResult:
     @functools.cached_property
     def num_divergences(self):
         """Returns the number of divergences in the MCMC chain."""
+        if not self.converged:
+            return 0
         return self.mcmc.get_extra_fields()["diverging"].sum()
 
     def print_summary(self):
@@ -1490,12 +1492,21 @@ def distribute_task(
 
     _func = _func if handle_errors else func
 
-    with warnings.catch_warnings():
-        # JAX doesn't work well with multiprocessing, but "spawn" should be fine
-        msg_to_ignore = ".*os\\.fork\\(\\).*"
-        warnings.filterwarnings("ignore", category=RuntimeWarning, message=msg_to_ignore)
-        with WorkerPool(n_jobs=n_jobs, use_dill=True, start_method="spawn") as pool:
-            results = pool.map(_func, zip(*args), **mpire_kwargs)
+    try:
+        with warnings.catch_warnings():
+            # JAX doesn't work well with multiprocessing, but "spawn" should be fine
+            msg_to_ignore = ".*os\\.fork\\(\\).*"
+            warnings.filterwarnings("ignore", category=RuntimeWarning, message=msg_to_ignore)
+            with WorkerPool(n_jobs=n_jobs, use_dill=True, start_method="spawn") as pool:
+                results = pool.map(_func, zip(*args), **mpire_kwargs)
+    except (PermissionError, OSError) as e:
+        # Shared memory (e.g., /dev/shm) may be unavailable in restricted
+        # environments (containers, CI); fall back to serial execution.
+        log.warning(f"Parallel execution unavailable ({e!r}); falling back to serial execution.")
+        results = [
+            _func(*a)
+            for a in tqdm(zip(*args), total=iters, desc=desc, disable=not progress_bar)
+        ]
 
     return results
 
